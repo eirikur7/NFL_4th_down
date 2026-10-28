@@ -1,6 +1,6 @@
 """Extension: the best strategy against a weak and a strong opponent, found the same way as for the equal opponent.
 
-    python scripts/opponents_search.py                 # about 1 hour (needs fork(): Linux or macOS)
+    python scripts/opponents_search.py                 # about 1 hour
     python scripts/opponents_search.py --skip-curves   # resume: step 1 is already in results.json
 
 Step 1  Opponent curves: the gain of "go if <= X yards" over the coaches, against each opponent.
@@ -10,7 +10,7 @@ Step 2  For the weak and the strong opponent: find the best strategy-7 cells and
         Saves results/results_opp_<opponent>.json (resumable) and results/results_opponents.json.
 """
 import sys
-from multiprocessing import get_context
+from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
@@ -26,14 +26,13 @@ DEAD_ZONE_NEAR = [25, 30, 35, 40, 45, 50]
 DEAD_ZONE_FAR = [35, 40, 45, 50, 55, 60, 65]
 DEAD_ZONE_MAX_YARDS = 10
 
-# Shared with the worker processes: the estimated parameters, the equal-opponent results and named policies.
+# The estimated parameters and the equal-opponent results (workers only get params and fg_range, see init_worker).
 shared = {}
 
 
 def main():
     shared["params"] = model.estimate(model.load_data())
     shared["results"] = model.load_results("results.json")
-    shared["policies"] = {}
 
     if "--skip-curves" not in sys.argv:
         opponent_curves()
@@ -49,33 +48,50 @@ def main():
 
 
 def play_in_parallel(jobs):
-    """jobs = [(policy name, opponent, n_games, seed)]. Returns the results of each job (win = 1, tie = 0.5)."""
-    with get_context("fork").Pool(2) as pool:
+    """jobs = [(policy spec, opponent, n_games, seed)]. Returns the results of each job (win = 1, tie = 0.5)."""
+    fg_range = shared["results"]["fg_range"]
+    with Pool(2, initializer=init_worker, initargs=(shared["params"], fg_range)) as pool:
         return pool.map(play_job, jobs)
 
 
+def init_worker(params, fg_range):
+    shared.update(params=params, fg_range=fg_range)
+
+
 def play_job(job):
-    policy_name, opponent, n_games, seed = job
-    policy = shared["policies"][policy_name]
+    spec, opponent, n_games, seed = job
+    policy = build_policy(spec, shared["fg_range"])
     return model.run(shared["params"], policy, opponent, n_games=n_games, seed=seed)[0].astype(np.float32)
+
+
+def build_policy(spec, fg_range):
+    """Policies are closures and cannot be sent to worker processes, so jobs carry a spec and workers build them:
+    ("coach",), ("always",), ("short", X) or ("dead_zone", X, near, far)."""
+    kind, *args = spec
+    if kind == "coach":
+        return model.coach
+    if kind == "always":
+        return model.always
+    rules = [model.short_yardage(args[0])]
+    if kind == "dead_zone":
+        rules.append(model.dead_zone(args[1], args[2], DEAD_ZONE_MAX_YARDS))
+    return model.make_policy(rules, fg_range)
 
 
 def opponent_curves():
     """Step 1: gain of "go if <= X" over the coaches against each opponent, and of our best strategies."""
     params, results = shared["params"], shared["results"]
     fg_range = results["fg_range"]
-    policies = shared["policies"]
-    policies["coach"] = model.coach
-    policies["always"] = model.always
-    for x in MAX_YARDS_CURVE:
-        policies[str(x)] = model.make_policy([model.short_yardage(x)], fg_range)
+    specs = {str(x): ("short", x) for x in MAX_YARDS_CURVE}
+    specs["always"] = ("always",)
+    specs["coach"] = ("coach",)
 
     names = [str(x) for x in MAX_YARDS_CURVE] + ["always"]
     gain, gain_ci_low, gain_ci_high = (pd.DataFrame(index=names, columns=OPPONENTS, dtype=float) for _ in range(3))
     coach_win_rate = {}
 
     for k, opponent in enumerate(OPPONENTS):
-        jobs = [(name, opponent, N_GAMES_CURVE, 1000 + k) for name in ["coach"] + names]
+        jobs = [(specs[name], opponent, N_GAMES_CURVE, 1000 + k) for name in ["coach"] + names]
         coach_results, *strategy_results = [r.astype(float) for r in play_in_parallel(jobs)]
         coach_win_rate[opponent] = coach_results.mean()
         for name, strategy_result in zip(names, strategy_results):
@@ -152,18 +168,9 @@ def search_against(opponent, seed_base):
 def dead_zone_grid(opponent, best_max_yards):
     """Win probability of "go if <= best_max_yards, and also in the dead zone (near-far)" for every range.
     Returns (heatmap, win probability without the dead zone)."""
-    fg_range = shared["results"]["fg_range"]
-    short_yardage = model.short_yardage(best_max_yards)
-    policies = shared["policies"]
-    policies["dead_zone_baseline"] = model.make_policy([short_yardage], fg_range)
-
     ranges = [(near, far) for near in DEAD_ZONE_NEAR for far in DEAD_ZONE_FAR if near < far]
-    for near, far in ranges:
-        rule = model.dead_zone(near, far, DEAD_ZONE_MAX_YARDS)
-        policies[f"dead_zone {near}-{far}"] = model.make_policy([short_yardage, rule], fg_range)
-
-    names = ["dead_zone_baseline"] + [f"dead_zone {near}-{far}" for near, far in ranges]
-    outcomes = play_in_parallel([(name, opponent, 10_000, 14) for name in names])
+    specs = [("short", best_max_yards)] + [("dead_zone", best_max_yards, near, far) for near, far in ranges]
+    outcomes = play_in_parallel([(spec, opponent, 10_000, 14) for spec in specs])
 
     heatmap = pd.DataFrame(index=DEAD_ZONE_NEAR, columns=DEAD_ZONE_FAR, dtype=float)
     for (near, far), range_results in zip(ranges, outcomes[1:]):

@@ -1,10 +1,10 @@
 """Searching for good strategies: the strategy-7 grid and successive halving.
 
-Both run many strategies on the same paired games in parallel, so they need a system with fork()
-(Linux or macOS). The workers read their settings from the module-level dicts below, which are set before the
-pool starts.
+Both run many strategies on the same paired games in parallel. Each worker process gets its settings once,
+through the pool's initializer, and keeps them in the module-level dict below.
 """
 import multiprocessing as mp
+import os
 
 import numpy as np
 import pandas as pd
@@ -14,8 +14,14 @@ from .game import run, scaled_games
 from .stats import mean_ci
 from .strategies import coach, make_policy, short_and_close
 
-_GRID_JOB = {}
-_HALVING_JOB = {}
+# Worker processes inherit this: one BLAS thread each, otherwise many workers run out of memory on Windows.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
+_JOB = {}
+
+
+def _set_job(job):
+    _JOB.update(job)
 
 
 def short_close_grid(params, fg_range, max_yards_values, max_endzone_values, n_games=100_000, seed=12,
@@ -23,8 +29,8 @@ def short_close_grid(params, fg_range, max_yards_values, max_endzone_values, n_g
     """Strategy 7 (go if <= X yards to go and <= Y yards from the end zone) for every (X, Y), on the same games.
     Returns (heatmap: win probability per cell, tied: cells not significantly worse than the best cell)."""
     cells = [(x, y) for x in max_yards_values for y in max_endzone_values]
-    _GRID_JOB.update(params=params, fg_range=fg_range, n_games=n_games, seed=seed, opponent=opponent)
-    with mp.get_context("fork").Pool(workers or mp.cpu_count()) as pool:
+    job = dict(params=params, fg_range=fg_range, n_games=n_games, seed=seed, opponent=opponent)
+    with mp.Pool(workers or mp.cpu_count(), initializer=_set_job, initargs=(job,)) as pool:
         results = dict(zip(cells, pool.map(_run_grid_cell, cells)))
 
     heatmap = pd.DataFrame(index=max_yards_values, columns=max_endzone_values, dtype=float)
@@ -39,7 +45,7 @@ def short_close_grid(params, fg_range, max_yards_values, max_endzone_values, n_g
 
 
 def _run_grid_cell(cell):
-    job = _GRID_JOB
+    job = _JOB
     policy = make_policy([short_and_close(*cell)], job["fg_range"])
     results = run(job["params"], policy, job["opponent"], n_games=job["n_games"], seed=job["seed"])[0]
     return results.astype(np.float32)
@@ -76,14 +82,14 @@ def successive_halving(params, all_candidates, fg_range, rounds=4, n_games=1_000
 
 def play_round(params, all_candidates, survivors, fg_range, opponent, n_games, seed, workers):
     """Play every surviving candidate on the same games. Returns [(results, go_share)] in survivors order."""
-    _HALVING_JOB.update(params=params, candidates=all_candidates, fg_range=fg_range, opponent=opponent,
-                        n_games=n_games, seed=seed)
-    with mp.get_context("fork").Pool(workers) as pool:
+    job = dict(params=params, candidates=all_candidates, fg_range=fg_range, opponent=opponent,
+               n_games=n_games, seed=seed)
+    with mp.Pool(workers, initializer=_set_job, initargs=(job,)) as pool:
         return pool.map(_run_candidate, survivors, chunksize=max(1, len(survivors) // (8 * workers)))
 
 
 def _run_candidate(index):
-    job = _HALVING_JOB
+    job = _JOB
     policy = policy_from_candidate(job["candidates"][index], job["fg_range"])
     return run(job["params"], policy, job["opponent"], n_games=job["n_games"], seed=job["seed"])
 
